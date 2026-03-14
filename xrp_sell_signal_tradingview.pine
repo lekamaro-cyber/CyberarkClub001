@@ -1,0 +1,304 @@
+// =============================================================================
+// XRP/USD - Sell Signal Detection & Accumulation Strategy
+// =============================================================================
+// Strategie: Detecter les signaux de vente AVANT la panique,
+// vendre au sommet, racheter dans le creux.
+// Mouvement minimum requis: 0.10 USD (frais Binance couverts)
+// Paire: XRP/USDT sur Binance | XRP/USD sur TradingView
+// =============================================================================
+
+//@version=5
+indicator("XRP Sell Signal Detector - Accumulation", overlay=true, max_labels_count=500)
+
+// ===================== PARAMETRES UTILISATEUR =====================
+grp_signal = "--- Parametres Signaux ---"
+min_move       = input.float(0.10, "Mouvement minimum (USD)", minval=0.01, step=0.01, group=grp_signal)
+rsi_period     = input.int(14, "RSI Periode", minval=2, group=grp_signal)
+rsi_overbought = input.int(70, "RSI Suracheté", minval=50, maxval=95, group=grp_signal)
+rsi_oversold   = input.int(30, "RSI Survendu", minval=5, maxval=50, group=grp_signal)
+macd_fast      = input.int(12, "MACD Rapide", group=grp_signal)
+macd_slow      = input.int(26, "MACD Lent", group=grp_signal)
+macd_signal    = input.int(9, "MACD Signal", group=grp_signal)
+
+grp_vol = "--- Volume & Volatilite ---"
+vol_ma_len     = input.int(20, "Moyenne Volume (periodes)", group=grp_vol)
+vol_spike      = input.float(1.5, "Multiplicateur Volume Spike", step=0.1, group=grp_vol)
+bb_length      = input.int(20, "Bollinger Bandes Periode", group=grp_vol)
+bb_mult        = input.float(2.0, "Bollinger Bandes Mult", step=0.1, group=grp_vol)
+
+grp_ma = "--- Moyennes Mobiles ---"
+ema_fast_len   = input.int(9, "EMA Rapide", group=grp_ma)
+ema_mid_len    = input.int(21, "EMA Moyenne", group=grp_ma)
+ema_slow_len   = input.int(50, "EMA Lente", group=grp_ma)
+sma_200_len    = input.int(200, "SMA 200", group=grp_ma)
+
+grp_display = "--- Affichage ---"
+show_table     = input.bool(true, "Afficher Tableau Probabilites", group=grp_display)
+show_zones     = input.bool(true, "Afficher Zones Support/Resistance", group=grp_display)
+show_targets   = input.bool(true, "Afficher Objectifs Prix", group=grp_display)
+
+// ===================== CALCULS INDICATEURS =====================
+
+// --- RSI ---
+rsi_val = ta.rsi(close, rsi_period)
+
+// --- MACD ---
+[macd_line, signal_line, macd_hist] = ta.macd(close, macd_fast, macd_slow, macd_signal)
+macd_cross_down = ta.crossunder(macd_line, signal_line)
+macd_cross_up   = ta.crossover(macd_line, signal_line)
+
+// --- Moyennes Mobiles ---
+ema_fast = ta.ema(close, ema_fast_len)
+ema_mid  = ta.ema(close, ema_mid_len)
+ema_slow = ta.ema(close, ema_slow_len)
+sma_200  = ta.sma(close, sma_200_len)
+
+// --- Bollinger Bands ---
+[bb_upper, bb_basis, bb_lower] = ta.bb(close, bb_length, bb_mult)
+bb_width = (bb_upper - bb_lower) / bb_basis * 100
+
+// --- Volume ---
+vol_ma     = ta.sma(volume, vol_ma_len)
+vol_ratio  = volume / vol_ma
+vol_spike_detected = vol_ratio > vol_spike
+
+// --- ATR (volatilite) ---
+atr_val    = ta.atr(14)
+atr_pct    = atr_val / close * 100
+
+// --- Stochastic RSI ---
+stoch_k = ta.stoch(rsi_val, rsi_val, rsi_val, 14)
+stoch_d = ta.sma(stoch_k, 3)
+
+// --- Divergences RSI ---
+price_higher_high = high > ta.highest(high, 5)[1]
+rsi_lower_high    = rsi_val < ta.highest(rsi_val, 5)[1]
+bearish_div       = price_higher_high and rsi_lower_high and rsi_val > 60
+
+price_lower_low   = low < ta.lowest(low, 5)[1]
+rsi_higher_low    = rsi_val > ta.lowest(rsi_val, 5)[1]
+bullish_div       = price_lower_low and rsi_higher_low and rsi_val < 40
+
+// --- OBV (On Balance Volume) ---
+obv = ta.cum(math.sign(ta.change(close)) * volume)
+obv_ema = ta.ema(obv, 21)
+obv_declining = obv < obv_ema and obv < obv[3]
+
+// --- Structure de marche ---
+swing_high = ta.pivothigh(high, 5, 5)
+swing_low  = ta.pivotlow(low, 5, 5)
+
+// ===================== SCORING SYSTEME DE VENTE (0-100) =====================
+
+sell_score = 0.0
+
+// 1. RSI en zone de surachat (max 20 pts)
+sell_score := sell_score + (rsi_val > rsi_overbought ? math.min((rsi_val - rsi_overbought) * 1.5, 20) : 0)
+
+// 2. MACD croisement baissier (15 pts)
+sell_score := sell_score + (macd_cross_down ? 15 : 0)
+// MACD histogramme en baisse (5 pts)
+sell_score := sell_score + (macd_hist < macd_hist[1] and macd_hist[1] < macd_hist[2] ? 5 : 0)
+
+// 3. Prix au dessus Bollinger superieure (10 pts)
+sell_score := sell_score + (close > bb_upper ? 10 : 0)
+// Prix proche Bollinger superieure (5 pts)
+sell_score := sell_score + (close > bb_upper - atr_val * 0.3 and close <= bb_upper ? 5 : 0)
+
+// 4. Volume spike sur bougie rouge (10 pts)
+sell_score := sell_score + (vol_spike_detected and close < open ? 10 : 0)
+
+// 5. EMA croisement baissier (10 pts)
+sell_score := sell_score + (ta.crossunder(ema_fast, ema_mid) ? 10 : 0)
+// Prix sous EMA rapide (5 pts)
+sell_score := sell_score + (close < ema_fast and close[1] > ema_fast[1] ? 5 : 0)
+
+// 6. Divergence baissiere RSI (15 pts)
+sell_score := sell_score + (bearish_div ? 15 : 0)
+
+// 7. OBV en baisse pendant que le prix monte (10 pts)
+sell_score := sell_score + (obv_declining and close > close[3] ? 10 : 0)
+
+// 8. StochRSI en surachat + croisement (5 pts)
+sell_score := sell_score + (stoch_k > 80 and ta.crossunder(stoch_k, stoch_d) ? 5 : 0)
+
+// Normaliser a 100 max
+sell_score := math.min(sell_score, 100)
+
+// ===================== SCORING SYSTEME D'ACHAT (0-100) =====================
+
+buy_score = 0.0
+
+// 1. RSI en zone de survente (max 20 pts)
+buy_score := buy_score + (rsi_val < rsi_oversold ? math.min((rsi_oversold - rsi_val) * 1.5, 20) : 0)
+
+// 2. MACD croisement haussier (15 pts)
+buy_score := buy_score + (macd_cross_up ? 15 : 0)
+// MACD histogramme en hausse (5 pts)
+buy_score := buy_score + (macd_hist > macd_hist[1] and macd_hist[1] > macd_hist[2] ? 5 : 0)
+
+// 3. Prix sous Bollinger inferieure (10 pts)
+buy_score := buy_score + (close < bb_lower ? 10 : 0)
+// Prix proche Bollinger inferieure (5 pts)
+buy_score := buy_score + (close < bb_lower + atr_val * 0.3 and close >= bb_lower ? 5 : 0)
+
+// 4. Volume spike sur bougie verte (10 pts)
+buy_score := buy_score + (vol_spike_detected and close > open ? 10 : 0)
+
+// 5. EMA croisement haussier (10 pts)
+buy_score := buy_score + (ta.crossover(ema_fast, ema_mid) ? 10 : 0)
+// Prix repasse au dessus EMA rapide (5 pts)
+buy_score := buy_score + (close > ema_fast and close[1] < ema_fast[1] ? 5 : 0)
+
+// 6. Divergence haussiere RSI (15 pts)
+buy_score := buy_score + (bullish_div ? 15 : 0)
+
+// 7. OBV en hausse pendant que le prix baisse (10 pts)
+buy_score := buy_score + (obv > obv_ema and obv > obv[3] and close < close[3] ? 10 : 0)
+
+// 8. StochRSI en survente + croisement (5 pts)
+buy_score := buy_score + (stoch_k < 20 and ta.crossover(stoch_k, stoch_d) ? 5 : 0)
+
+// Normaliser
+buy_score := math.min(buy_score, 100)
+
+// ===================== FILTRE MOUVEMENT MINIMUM 0.10 USD =====================
+
+// Estimer le mouvement potentiel base sur ATR
+potential_move = atr_val * 1.5
+move_sufficient = potential_move >= min_move
+
+// Objectifs de prix
+sell_target = close - potential_move
+buy_target  = close + potential_move
+
+// ===================== SIGNAUX FINAUX =====================
+
+// Signal SELL: score >= 40 ET mouvement suffisant
+strong_sell = sell_score >= 70 and move_sufficient
+medium_sell = sell_score >= 50 and sell_score < 70 and move_sufficient
+weak_sell   = sell_score >= 40 and sell_score < 50 and move_sufficient
+
+// Signal BUY: score >= 40 ET mouvement suffisant
+strong_buy  = buy_score >= 70 and move_sufficient
+medium_buy  = buy_score >= 50 and buy_score < 70 and move_sufficient
+weak_buy    = buy_score >= 40 and buy_score < 50 and move_sufficient
+
+// ===================== AFFICHAGE GRAPHIQUE =====================
+
+// --- Moyennes Mobiles ---
+plot(ema_fast, "EMA Rapide", color=color.new(color.yellow, 30), linewidth=1)
+plot(ema_mid, "EMA Moyenne", color=color.new(color.orange, 30), linewidth=1)
+plot(ema_slow, "EMA Lente", color=color.new(color.red, 30), linewidth=2)
+plot(sma_200, "SMA 200", color=color.new(color.white, 30), linewidth=2, style=plot.style_circles)
+
+// --- Bollinger Bands ---
+p_bb_upper = plot(bb_upper, "BB Sup", color=color.new(color.gray, 70))
+p_bb_lower = plot(bb_lower, "BB Inf", color=color.new(color.gray, 70))
+fill(p_bb_upper, p_bb_lower, color=color.new(color.gray, 92))
+
+// --- Signaux SELL ---
+plotshape(strong_sell, "SELL FORT", shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.large)
+plotshape(medium_sell, "SELL MOYEN", shape.triangledown, location.abovebar, color.new(color.orange, 0), size=size.normal)
+plotshape(weak_sell, "SELL FAIBLE", shape.triangledown, location.abovebar, color.new(color.yellow, 20), size=size.small)
+
+// --- Signaux BUY ---
+plotshape(strong_buy, "BUY FORT", shape.triangleup, location.belowbar, color.new(color.green, 0), size=size.large)
+plotshape(medium_buy, "BUY MOYEN", shape.triangleup, location.belowbar, color.new(color.lime, 0), size=size.normal)
+plotshape(weak_buy, "BUY FAIBLE", shape.triangleup, location.belowbar, color.new(color.teal, 20), size=size.small)
+
+// --- Labels avec details ---
+if strong_sell
+    label.new(bar_index, high + atr_val * 0.5,
+      "VENDRE " + str.tostring(sell_score, "#") + "%\nObj: " + str.tostring(sell_target, "#.####"),
+      color=color.red, textcolor=color.white, style=label.style_label_down, size=size.normal)
+
+if strong_buy
+    label.new(bar_index, low - atr_val * 0.5,
+      "ACHETER " + str.tostring(buy_score, "#") + "%\nObj: " + str.tostring(buy_target, "#.####"),
+      color=color.green, textcolor=color.white, style=label.style_label_up, size=size.normal)
+
+// --- Couleur de fond selon tendance ---
+bg_col = sell_score >= 60 ? color.new(color.red, 90) :
+         buy_score >= 60 ? color.new(color.green, 90) :
+         na
+bgcolor(bg_col, title="Fond Signal")
+
+// ===================== TABLEAU DE BORD =====================
+
+if show_table and barstate.islast
+    var tbl = table.new(position.top_right, 2, 14,
+      bgcolor=color.new(color.black, 20),
+      border_color=color.gray, border_width=1,
+      frame_color=color.gray, frame_width=2)
+
+    // Header
+    table.cell(tbl, 0, 0, "XRP/USD SIGNAUX", text_color=color.white, text_size=size.normal, bgcolor=color.new(color.blue, 30))
+    table.cell(tbl, 1, 0, "VALEUR", text_color=color.white, text_size=size.normal, bgcolor=color.new(color.blue, 30))
+
+    // Prix actuel
+    table.cell(tbl, 0, 1, "Prix", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 1, str.tostring(close, "#.####"), text_color=color.white, text_size=size.small)
+
+    // Score SELL
+    sell_col = sell_score >= 70 ? color.red : sell_score >= 50 ? color.orange : sell_score >= 40 ? color.yellow : color.gray
+    table.cell(tbl, 0, 2, "% BAISSE", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 2, str.tostring(sell_score, "#") + "%", text_color=sell_col, text_size=size.normal, bgcolor=color.new(sell_col, 85))
+
+    // Score BUY
+    buy_col = buy_score >= 70 ? color.green : buy_score >= 50 ? color.lime : buy_score >= 40 ? color.teal : color.gray
+    table.cell(tbl, 0, 3, "% HAUSSE", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 3, str.tostring(buy_score, "#") + "%", text_color=buy_col, text_size=size.normal, bgcolor=color.new(buy_col, 85))
+
+    // RSI
+    rsi_col = rsi_val > rsi_overbought ? color.red : rsi_val < rsi_oversold ? color.green : color.white
+    table.cell(tbl, 0, 4, "RSI (" + str.tostring(rsi_period) + ")", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 4, str.tostring(rsi_val, "#.#"), text_color=rsi_col, text_size=size.small)
+
+    // MACD
+    macd_col = macd_line > signal_line ? color.green : color.red
+    table.cell(tbl, 0, 5, "MACD", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 5, (macd_line > signal_line ? "HAUSSIER" : "BAISSIER"), text_color=macd_col, text_size=size.small)
+
+    // Volume
+    table.cell(tbl, 0, 6, "Volume Ratio", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 6, str.tostring(vol_ratio, "#.##") + "x", text_color=(vol_spike_detected ? color.yellow : color.white), text_size=size.small)
+
+    // ATR / Mouvement potentiel
+    table.cell(tbl, 0, 7, "Mouvement Est.", text_color=color.white, text_size=size.small)
+    move_col = move_sufficient ? color.green : color.red
+    table.cell(tbl, 1, 7, "$" + str.tostring(potential_move, "#.####"), text_color=move_col, text_size=size.small)
+
+    // Mouvement minimum
+    table.cell(tbl, 0, 8, "Min Requis", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 8, "$" + str.tostring(min_move, "#.##") + (move_sufficient ? " OK" : " NON"), text_color=move_col, text_size=size.small)
+
+    // Bollinger Width
+    table.cell(tbl, 0, 9, "BB Width %", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 9, str.tostring(bb_width, "#.##") + "%", text_color=color.white, text_size=size.small)
+
+    // Tendance EMA
+    trend_txt = ema_fast > ema_mid and ema_mid > ema_slow ? "HAUSSE" : ema_fast < ema_mid and ema_mid < ema_slow ? "BAISSE" : "NEUTRE"
+    trend_col = ema_fast > ema_mid and ema_mid > ema_slow ? color.green : ema_fast < ema_mid and ema_mid < ema_slow ? color.red : color.yellow
+    table.cell(tbl, 0, 10, "Tendance", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 10, trend_txt, text_color=trend_col, text_size=size.small)
+
+    // Position vs SMA200
+    table.cell(tbl, 0, 11, "vs SMA200", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 11, close > sma_200 ? "AU DESSUS" : "EN DESSOUS", text_color=(close > sma_200 ? color.green : color.red), text_size=size.small)
+
+    // Objectif SELL
+    table.cell(tbl, 0, 12, "Obj. Vente", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 12, str.tostring(sell_target, "#.####"), text_color=color.orange, text_size=size.small)
+
+    // Objectif BUY
+    table.cell(tbl, 0, 13, "Obj. Rachat", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 13, str.tostring(buy_target, "#.####"), text_color=color.lime, text_size=size.small)
+
+// ===================== ALERTES =====================
+
+alertcondition(strong_sell, title="SELL FORT XRP", message="XRP SELL FORT - Score: {{plot_0}} - Prix: {{close}}")
+alertcondition(medium_sell, title="SELL MOYEN XRP", message="XRP SELL MOYEN - Prix: {{close}}")
+alertcondition(strong_buy, title="BUY FORT XRP", message="XRP BUY FORT - Score: {{plot_1}} - Prix: {{close}}")
+alertcondition(medium_buy, title="BUY MOYEN XRP", message="XRP BUY MOYEN - Prix: {{close}}")
+alertcondition(strong_sell or strong_buy, title="SIGNAL FORT XRP", message="XRP SIGNAL FORT DETECTE - Prix: {{close}}")
