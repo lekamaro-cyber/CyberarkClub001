@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.pyo
+xrp_trades.log
+.env
