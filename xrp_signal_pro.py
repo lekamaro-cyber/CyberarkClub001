@@ -1208,6 +1208,15 @@ Exemples:
 
   # Dry-run multi-TF
   python xrp_signal_pro.py --realtime --trade --dry-run --key CLE --secret SECRET --loop
+
+  # MODE TURBO: scan 3s, websocket auto, TF courts, micro-seuils
+  python xrp_signal_pro.py --turbo
+
+  # Turbo + trading reel avec minimum Binance (~5 XRP)
+  python xrp_signal_pro.py --turbo --trade --quantity 5 --key CLE --secret SECRET
+
+  # Turbo + scan personnalise toutes les 5s
+  python xrp_signal_pro.py --turbo --loop-delay 5
         """
     )
 
@@ -1225,10 +1234,12 @@ Exemples:
                          help="Mode websocket temps reel")
     grp_gen.add_argument("--loop", action="store_true",
                          help="Mode boucle continue")
-    grp_gen.add_argument("--loop-delay", type=int, default=30,
-                         help="Delai entre analyses en mode polling (defaut: 30s)")
+    grp_gen.add_argument("--loop-delay", type=float, default=30,
+                         help="Delai entre analyses en secondes (defaut: 30, min: 2)")
     grp_gen.add_argument("--min-move", type=float, default=MIN_MOVE_USD,
                          help=f"Mouvement minimum USD (defaut: {MIN_MOVE_USD})")
+    grp_gen.add_argument("--turbo", action="store_true",
+                         help="Mode turbo: scan toutes les 3s, seuils bas, TF courts")
 
     # Trading
     grp_trade = parser.add_argument_group("Trading")
@@ -1237,7 +1248,7 @@ Exemples:
     grp_trade.add_argument("--dry-run", action="store_true",
                            help="Simuler les ordres")
     grp_trade.add_argument("--quantity", type=float, default=10.0,
-                           help="Quantite XRP par trade")
+                           help="Quantite XRP par trade (min Binance: ~5 XRP / 10 USDT)")
     grp_trade.add_argument("--sell-threshold", type=int, default=70,
                            help="Score min pour vendre (defaut: 70)")
     grp_trade.add_argument("--buy-threshold", type=int, default=70,
@@ -1258,6 +1269,18 @@ Exemples:
     api_key = args.key or os.environ.get("BINANCE_API_KEY", "")
     api_secret = args.secret or os.environ.get("BINANCE_API_SECRET", "")
     MIN_MOVE_USD = args.min_move
+
+    # Mode turbo: scan agressif pour serveur puissant
+    if args.turbo:
+        args.loop = True
+        args.loop_delay = max(args.loop_delay, 3) if args.loop_delay != 30 else 3
+        args.timeframes = ['1m', '3m', '5m', '15m']
+        MIN_MOVE_USD = 0.02  # Accepter les micro-mouvements en test
+        if not args.realtime:
+            args.realtime = HAS_WEBSOCKET  # Auto-activer websocket si dispo
+
+    # Securite: loop-delay minimum 2s pour ne pas spam l'API
+    args.loop_delay = max(2, args.loop_delay)
 
     # Commandes rapides
     if args.history:
@@ -1284,13 +1307,24 @@ Exemples:
     print("=" * 70)
     print(f"  Paire           : {SYMBOL}")
     print(f"  Timeframes      : {', '.join(args.timeframes)}")
-    print(f"  Mode            : {'WEBSOCKET TEMPS REEL' if args.realtime else 'POLLING PARALLELE'}")
+    mode_str = 'WEBSOCKET TEMPS REEL' if args.realtime else 'POLLING PARALLELE'
+    if args.turbo:
+        mode_str += ' [TURBO]'
+    print(f"  Mode            : {mode_str}")
+    print(f"  Scan interval   : {args.loop_delay}s" if args.loop else "")
     print(f"  Mouvement min.  : {MIN_MOVE_USD} USD")
     if args.trade:
         print(f"  Trading         : {'DRY-RUN' if args.dry_run else 'REEL'}")
         print(f"  Quantite/trade  : {args.quantity} XRP")
         print(f"  Seuil SELL/BUY  : {args.sell_threshold}% / {args.buy_threshold}%")
     print("=" * 70)
+
+    # Avertissement quantite minimum Binance
+    if args.trade and args.quantity < 5:
+        print(f"\n  [!] ATTENTION: quantity={args.quantity} XRP")
+        print(f"  Binance impose un minimum de ~5 XRP (10 USDT min notional).")
+        print(f"  Quantite ajustee a 5 XRP pour respecter les limites Binance.")
+        args.quantity = 5.0
 
     # Trade config
     trade_config = None
