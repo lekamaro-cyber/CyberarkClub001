@@ -154,6 +154,328 @@ trade_logger = logging.getLogger("xrp_trader")
 trade_logger.setLevel(logging.INFO)
 
 TRADE_LOG_FILE = "xrp_trades.log"
+SIGNAL_HISTORY_FILE = "xrp_signal_history.json"
+
+# Nombre de bougies a attendre pour verifier le resultat d'un signal
+VERIFY_AFTER_CANDLES = 10
+
+
+# =============================================================================
+# HISTORIQUE DES SIGNAUX & TAUX D'ERREUR
+# =============================================================================
+
+def load_signal_history():
+    """Charge l'historique des signaux depuis le fichier JSON."""
+    if os.path.exists(SIGNAL_HISTORY_FILE):
+        try:
+            with open(SIGNAL_HISTORY_FILE, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {'signals': [], 'version': 1}
+
+
+def save_signal_history(history):
+    """Sauvegarde l'historique des signaux."""
+    with open(SIGNAL_HISTORY_FILE, 'w') as f:
+        json.dump(history, f, indent=2, default=str)
+
+
+def record_signal(signal_type, score, price, rsi, trend, potential_move,
+                  interval, traded=False, trade_result=None):
+    """
+    Enregistre un signal dans l'historique.
+
+    Args:
+        signal_type: "SELL" ou "BUY"
+        score: Score du signal (0-100)
+        price: Prix au moment du signal
+        rsi: RSI au moment du signal
+        trend: Tendance EMA
+        potential_move: Mouvement estime (ATR)
+        interval: Timeframe utilise
+        traded: Si un ordre a ete passe
+        trade_result: Resultat du trade si applicable
+    """
+    history = load_signal_history()
+
+    entry = {
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'type': signal_type,
+        'score': round(score, 1),
+        'price': round(price, 6),
+        'rsi': round(rsi, 1),
+        'trend': trend,
+        'potential_move': round(potential_move, 6),
+        'interval': interval,
+        'traded': traded,
+        'trade_result': trade_result,
+        # Objectifs
+        'target_price': round(
+            price - potential_move if signal_type == "SELL" else price + potential_move, 6
+        ),
+        # Verification
+        'verified': False,
+        'outcome': None,        # "CORRECT", "WRONG", "PARTIAL"
+        'price_after': None,    # Prix apres N bougies
+        'actual_move': None,    # Mouvement reel
+        'pnl_pct': None,        # Profit/perte en %
+    }
+
+    history['signals'].append(entry)
+    save_signal_history(history)
+    return entry
+
+
+def verify_pending_signals(df):
+    """
+    Verifie les signaux non verifies en comparant avec les prix actuels.
+    Met a jour l'historique avec le resultat (CORRECT/WRONG/PARTIAL).
+    """
+    history = load_signal_history()
+    if not history['signals']:
+        return
+
+    current_price = df['close'].iloc[-1]
+    modified = False
+
+    for signal in history['signals']:
+        if signal['verified']:
+            continue
+
+        # Verifier si assez de temps s'est ecoule
+        signal_time = datetime.fromisoformat(signal['timestamp'])
+        now = datetime.now(timezone.utc)
+        # Attendre au minimum 15 minutes avant de verifier
+        elapsed_minutes = (now - signal_time).total_seconds() / 60
+        if elapsed_minutes < 15:
+            continue
+
+        signal_price = signal['price']
+        target_price = signal['target_price']
+        potential_move = signal['potential_move']
+
+        if signal['type'] == "SELL":
+            # Signal de vente: correct si le prix a baisse
+            actual_move = signal_price - current_price
+            pnl_pct = (actual_move / signal_price) * 100
+
+            if actual_move >= potential_move * 0.8:
+                outcome = "CORRECT"
+            elif actual_move > 0:
+                outcome = "PARTIAL"
+            else:
+                outcome = "WRONG"
+
+        else:  # BUY
+            # Signal d'achat: correct si le prix a monte
+            actual_move = current_price - signal_price
+            pnl_pct = (actual_move / signal_price) * 100
+
+            if actual_move >= potential_move * 0.8:
+                outcome = "CORRECT"
+            elif actual_move > 0:
+                outcome = "PARTIAL"
+            else:
+                outcome = "WRONG"
+
+        signal['verified'] = True
+        signal['outcome'] = outcome
+        signal['price_after'] = round(current_price, 6)
+        signal['actual_move'] = round(actual_move, 6)
+        signal['pnl_pct'] = round(pnl_pct, 2)
+        modified = True
+
+    if modified:
+        save_signal_history(history)
+
+
+def calc_signal_stats(history, signal_type=None):
+    """
+    Calcule les statistiques de performance des signaux.
+
+    Returns:
+        dict avec les stats
+    """
+    signals = history['signals']
+    if signal_type:
+        signals = [s for s in signals if s['type'] == signal_type]
+
+    total = len(signals)
+    verified = [s for s in signals if s['verified']]
+    pending = total - len(verified)
+
+    if not verified:
+        return {
+            'total': total,
+            'verified': 0,
+            'pending': pending,
+            'correct': 0,
+            'partial': 0,
+            'wrong': 0,
+            'accuracy': 0.0,
+            'accuracy_with_partial': 0.0,
+            'avg_pnl': 0.0,
+            'total_pnl': 0.0,
+            'best_trade': None,
+            'worst_trade': None,
+            'avg_score': 0.0,
+        }
+
+    correct = len([s for s in verified if s['outcome'] == "CORRECT"])
+    partial = len([s for s in verified if s['outcome'] == "PARTIAL"])
+    wrong = len([s for s in verified if s['outcome'] == "WRONG"])
+
+    pnls = [s['pnl_pct'] for s in verified if s['pnl_pct'] is not None]
+    avg_pnl = sum(pnls) / len(pnls) if pnls else 0.0
+    total_pnl = sum(pnls)
+
+    scores = [s['score'] for s in signals]
+    avg_score = sum(scores) / len(scores) if scores else 0.0
+
+    best = max(verified, key=lambda s: s.get('pnl_pct', 0)) if verified else None
+    worst = min(verified, key=lambda s: s.get('pnl_pct', 0)) if verified else None
+
+    n_verified = len(verified)
+    return {
+        'total': total,
+        'verified': n_verified,
+        'pending': pending,
+        'correct': correct,
+        'partial': partial,
+        'wrong': wrong,
+        'accuracy': (correct / n_verified * 100) if n_verified > 0 else 0.0,
+        'accuracy_with_partial': ((correct + partial) / n_verified * 100) if n_verified > 0 else 0.0,
+        'avg_pnl': avg_pnl,
+        'total_pnl': total_pnl,
+        'best_trade': best,
+        'worst_trade': worst,
+        'avg_score': avg_score,
+    }
+
+
+def print_signal_history():
+    """Affiche le rapport complet de l'historique des signaux."""
+    history = load_signal_history()
+
+    if not history['signals']:
+        print("\n  Aucun signal enregistre.")
+        print(f"  Lancez le scanner avec --trade ou --record pour commencer a enregistrer.")
+        return
+
+    # Stats globales
+    all_stats = calc_signal_stats(history)
+    sell_stats = calc_signal_stats(history, "SELL")
+    buy_stats = calc_signal_stats(history, "BUY")
+
+    print("\n" + "=" * 70)
+    print("  HISTORIQUE DES SIGNAUX - RAPPORT DE PERFORMANCE")
+    print("=" * 70)
+
+    # --- Resume global ---
+    print(f"\n  Total signaux       : {all_stats['total']}")
+    print(f"  Verifies            : {all_stats['verified']}")
+    print(f"  En attente          : {all_stats['pending']}")
+
+    if all_stats['verified'] > 0:
+        print(f"\n  --- TAUX DE REUSSITE ---")
+        print(f"  Corrects            : {all_stats['correct']} ({all_stats['accuracy']:.1f}%)")
+        print(f"  Partiels            : {all_stats['partial']}")
+        print(f"  Faux                : {all_stats['wrong']}")
+        print(f"  Precision (strict)  : {all_stats['accuracy']:.1f}%")
+        print(f"  Precision (souple)  : {all_stats['accuracy_with_partial']:.1f}%")
+        print(f"  Score moyen signal  : {all_stats['avg_score']:.0f}%")
+        print(f"\n  --- PROFIT/PERTE ---")
+        print(f"  P&L moyen           : {all_stats['avg_pnl']:+.2f}%")
+        print(f"  P&L cumule          : {all_stats['total_pnl']:+.2f}%")
+
+        if all_stats['best_trade']:
+            b = all_stats['best_trade']
+            print(f"  Meilleur trade      : {b['type']} @ {b['price']:.4f} -> {b['pnl_pct']:+.2f}% ({b['timestamp'][:16]})")
+        if all_stats['worst_trade']:
+            w = all_stats['worst_trade']
+            print(f"  Pire trade          : {w['type']} @ {w['price']:.4f} -> {w['pnl_pct']:+.2f}% ({w['timestamp'][:16]})")
+
+    # --- Stats par type ---
+    print("\n" + "-" * 70)
+    print("  SIGNAUX DE VENTE (SELL)")
+    print("-" * 70)
+    _print_type_stats(sell_stats)
+
+    print("\n" + "-" * 70)
+    print("  SIGNAUX D'ACHAT (BUY)")
+    print("-" * 70)
+    _print_type_stats(buy_stats)
+
+    # --- Tableau des derniers signaux ---
+    print("\n" + "-" * 70)
+    print("  DERNIERS SIGNAUX (20 plus recents)")
+    print("-" * 70)
+    print(f"  {'TYPE':5s} | {'SCORE':5s} | {'PRIX':>10s} | {'RESULTAT':8s} | {'P&L':>7s} | {'DATE':16s}")
+    print("  " + "-" * 65)
+
+    recent = history['signals'][-20:]
+    for s in reversed(recent):
+        outcome = s.get('outcome', 'EN ATT.')
+        if outcome is None:
+            outcome = 'EN ATT.'
+
+        pnl = f"{s['pnl_pct']:+.2f}%" if s.get('pnl_pct') is not None else "  -   "
+
+        # Indicateur visuel
+        if outcome == "CORRECT":
+            icon = "[OK]"
+        elif outcome == "PARTIAL":
+            icon = "[~~]"
+        elif outcome == "WRONG":
+            icon = "[XX]"
+        else:
+            icon = "[..]"
+
+        print(f"  {s['type']:5s} | {s['score']:5.0f} | {s['price']:10.4f} | {icon:4s} {outcome:8s} | {pnl:>7s} | {s['timestamp'][:16]}")
+
+    # --- Stats par tranche de score ---
+    print("\n" + "-" * 70)
+    print("  PRECISION PAR TRANCHE DE SCORE")
+    print("-" * 70)
+    print(f"  {'TRANCHE':12s} | {'TOTAL':>5s} | {'CORRECT':>7s} | {'FAUX':>5s} | {'PRECISION':>9s} | {'P&L MOY':>8s}")
+    print("  " + "-" * 58)
+
+    verified_signals = [s for s in history['signals'] if s['verified']]
+    for low, high, label in [(40, 50, "40-49%"), (50, 60, "50-59%"),
+                              (60, 70, "60-69%"), (70, 80, "70-79%"),
+                              (80, 101, "80-100%")]:
+        bucket = [s for s in verified_signals if low <= s['score'] < high]
+        if not bucket:
+            print(f"  {label:12s} |     0 |       - |     - |         - |        -")
+            continue
+
+        n = len(bucket)
+        c = len([s for s in bucket if s['outcome'] == "CORRECT"])
+        w = len([s for s in bucket if s['outcome'] == "WRONG"])
+        acc = c / n * 100 if n > 0 else 0
+        pnls = [s['pnl_pct'] for s in bucket if s['pnl_pct'] is not None]
+        avg_p = sum(pnls) / len(pnls) if pnls else 0
+
+        print(f"  {label:12s} | {n:5d} | {c:7d} | {w:5d} | {acc:8.1f}% | {avg_p:+7.2f}%")
+
+    print("\n" + "=" * 70)
+    print(f"  Fichier historique: {SIGNAL_HISTORY_FILE}")
+    print("=" * 70)
+
+
+def _print_type_stats(stats):
+    """Affiche les stats pour un type de signal."""
+    print(f"  Total         : {stats['total']}")
+    print(f"  Verifies      : {stats['verified']}")
+    if stats['verified'] > 0:
+        print(f"  Corrects      : {stats['correct']} ({stats['accuracy']:.1f}%)")
+        print(f"  Partiels      : {stats['partial']}")
+        print(f"  Faux          : {stats['wrong']}")
+        print(f"  P&L moyen     : {stats['avg_pnl']:+.2f}%")
+        print(f"  P&L cumule    : {stats['total_pnl']:+.2f}%")
+    else:
+        print("  (aucun signal verifie)")
 
 
 def setup_trade_logging():
@@ -482,6 +804,7 @@ def execute_signal_trade(client, df, trade_config):
     move_ok = last['move_ok']
     price = last['close']
     potential_move = last['potential_move']
+    rsi = last['rsi']
 
     dry_run = trade_config['dry_run']
     quantity = trade_config['quantity']
@@ -491,6 +814,19 @@ def execute_signal_trade(client, df, trade_config):
     use_stop_loss = trade_config['use_stop_loss']
     stop_loss_pct = trade_config['stop_loss_pct']
     symbol_info = trade_config.get('symbol_info')
+    record = trade_config.get('record', True)
+    interval = trade_config.get('interval', DEFAULT_INTERVAL)
+
+    # Tendance pour l'historique
+    if last['ema_fast'] > last['ema_mid'] > last['ema_slow']:
+        trend = "HAUSSE"
+    elif last['ema_fast'] < last['ema_mid'] < last['ema_slow']:
+        trend = "BAISSE"
+    else:
+        trend = "NEUTRE"
+
+    # Verifier les signaux precedents
+    verify_pending_signals(df)
 
     # Recuperer les soldes
     xrp_balance = get_account_balance(client, "XRP")
@@ -527,6 +863,12 @@ def execute_signal_trade(client, df, trade_config):
             dry_run=dry_run, order_type=order_type,
             symbol_info=symbol_info
         )
+
+        # Enregistrer le signal
+        if record:
+            record_signal("SELL", sell_score, price, rsi, trend,
+                          potential_move, interval, traded=result is not None,
+                          trade_result="DRY-RUN" if dry_run else "EXECUTED")
 
         if result:
             # Placer un ordre de rachat en dessous (accumulation)
@@ -570,6 +912,12 @@ def execute_signal_trade(client, df, trade_config):
             symbol_info=symbol_info
         )
 
+        # Enregistrer le signal
+        if record:
+            record_signal("BUY", buy_score, price, rsi, trend,
+                          potential_move, interval, traded=result is not None,
+                          trade_result="DRY-RUN" if dry_run else "EXECUTED")
+
         if result and use_stop_loss:
             # Placer un stop-loss
             stop_price = round_tick_size(
@@ -586,6 +934,15 @@ def execute_signal_trade(client, df, trade_config):
 
     else:
         print(f"\n  Pas de trade (SELL: {sell_score:.0f}% < {sell_threshold}% | BUY: {buy_score:.0f}% < {buy_threshold}%)")
+
+        # Enregistrer quand meme les signaux au dessus de 40% pour le suivi
+        if record:
+            if sell_score >= 40 and move_ok:
+                record_signal("SELL", sell_score, price, rsi, trend,
+                              potential_move, interval, traded=False)
+            elif buy_score >= 40 and move_ok:
+                record_signal("BUY", buy_score, price, rsi, trend,
+                              potential_move, interval, traded=False)
 
 
 def print_open_orders(client):
@@ -981,6 +1338,15 @@ Exemples:
     grp_trade.add_argument("--show-orders", action="store_true",
                            help="Afficher les ordres ouverts et quitter")
 
+    # --- Parametres historique ---
+    grp_hist = parser.add_argument_group("Historique & Stats")
+    grp_hist.add_argument("--history", action="store_true",
+                          help="Afficher le rapport de performance des signaux")
+    grp_hist.add_argument("--record", action="store_true",
+                          help="Enregistrer les signaux meme sans --trade (mode observation)")
+    grp_hist.add_argument("--clear-history", action="store_true",
+                          help="Effacer l'historique des signaux")
+
     args = parser.parse_args()
 
     # Cles API depuis env si pas en argument
@@ -1018,7 +1384,16 @@ Exemples:
             print("\n  *** ATTENTION: MODE REEL - DE VRAIS ORDRES SERONT PASSES ***")
     print("=" * 60)
 
-    # Commandes rapides: show-orders, cancel-orders
+    # Commandes rapides: history, show-orders, cancel-orders
+    if args.history:
+        print_signal_history()
+        return
+
+    if args.clear_history:
+        save_signal_history({'signals': [], 'version': 1})
+        print("  Historique des signaux efface.")
+        return
+
     if args.show_orders or args.cancel_orders:
         client = Client(api_key, api_secret)
         if args.show_orders:
@@ -1029,17 +1404,21 @@ Exemples:
 
     # Config trading
     trade_config = None
-    if args.trade:
+    if args.trade or args.record:
         trade_config = {
-            'dry_run': args.dry_run,
+            'dry_run': args.dry_run if args.trade else True,
             'quantity': args.quantity,
-            'sell_threshold': args.sell_threshold,
-            'buy_threshold': args.buy_threshold,
+            'sell_threshold': args.sell_threshold if args.trade else 40,
+            'buy_threshold': args.buy_threshold if args.trade else 40,
             'order_type': args.order_type,
             'use_stop_loss': args.stop_loss,
             'stop_loss_pct': args.stop_loss_pct,
             'symbol_info': None,  # sera rempli au premier cycle
+            'record': True,
+            'interval': args.interval,
         }
+        if args.record and not args.trade:
+            print("  Mode OBSERVATION: signaux enregistres sans passer d'ordres")
 
     while True:
         try:
