@@ -923,6 +923,8 @@ def print_analysis(df):
 # =============================================================================
 
 def main():
+    global MIN_MOVE_USD
+
     parser = argparse.ArgumentParser(
         description="XRP/USDT Signal Detector & Auto-Trader - Binance",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -985,7 +987,6 @@ Exemples:
     api_key = args.key or os.environ.get("BINANCE_API_KEY", "")
     api_secret = args.secret or os.environ.get("BINANCE_API_SECRET", "")
 
-    global MIN_MOVE_USD
     MIN_MOVE_USD = args.min_move
 
     # Verifier que les cles sont presentes pour le trading
