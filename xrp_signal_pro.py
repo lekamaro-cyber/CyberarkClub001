@@ -1216,23 +1216,29 @@ def print_multi_tf_analysis(combined):
     fetch_time = combined.get('fetch_time_ms', 0)
     is_realtime = combined.get('realtime', False)
 
+    # Seuils d'affichage (adaptes en mode agressif via RSI_OVERBOUGHT)
+    is_aggressive = RSI_OVERBOUGHT < 70
+    th_fort = 50 if is_aggressive else 70
+    th_moyen = 35 if is_aggressive else 50
+    th_faible = 25 if is_aggressive else 40
+
     # Signal principal
-    if combined_sell >= 70 and move_ok:
+    if combined_sell >= th_fort and move_ok:
         signal = ">>> VENDRE MAINTENANT <<<"
         signal_level = "FORT"
-    elif combined_sell >= 50 and move_ok:
+    elif combined_sell >= th_moyen and move_ok:
         signal = ">> SIGNAL DE VENTE <<"
         signal_level = "MOYEN"
-    elif combined_sell >= 40 and move_ok:
+    elif combined_sell >= th_faible and move_ok:
         signal = "> Vente possible <"
         signal_level = "FAIBLE"
-    elif combined_buy >= 70 and move_ok:
+    elif combined_buy >= th_fort and move_ok:
         signal = ">>> ACHETER MAINTENANT <<<"
         signal_level = "FORT"
-    elif combined_buy >= 50 and move_ok:
+    elif combined_buy >= th_moyen and move_ok:
         signal = ">> SIGNAL D'ACHAT <<"
         signal_level = "MOYEN"
-    elif combined_buy >= 40 and move_ok:
+    elif combined_buy >= th_faible and move_ok:
         signal = "> Achat possible <"
         signal_level = "FAIBLE"
     else:
@@ -1662,7 +1668,7 @@ def print_signal_history():
 # =============================================================================
 
 def main():
-    global MIN_MOVE_USD
+    global MIN_MOVE_USD, RSI_OVERBOUGHT, RSI_OVERSOLD, VOL_SPIKE_MULT, BB_STD
 
     parser = argparse.ArgumentParser(
         description="XRP Signal Detector PRO - Multi-TF & Websocket",
@@ -1689,6 +1695,12 @@ Exemples:
 
   # Turbo + scan personnalise toutes les 5s
   python xrp_signal_pro.py --turbo --loop-delay 5
+
+  # MODE AGRESSIF: seuils tres bas, trades meme en marche calme
+  python xrp_signal_pro.py --aggressive --trade --dry-run --key CLE --secret SECRET
+
+  # Turbo + agressif (combo ultime bare metal)
+  python xrp_signal_pro.py --turbo --aggressive --trade --quantity 5 --key CLE --secret SECRET
         """
     )
 
@@ -1712,6 +1724,8 @@ Exemples:
                          help=f"Mouvement minimum USD (defaut: {MIN_MOVE_USD})")
     grp_gen.add_argument("--turbo", action="store_true",
                          help="Mode turbo: scan toutes les 3s, seuils bas, TF courts")
+    grp_gen.add_argument("--aggressive", action="store_true",
+                         help="Mode agressif: seuils tres bas, genere des trades meme en marche calme")
     grp_gen.add_argument("--no-onchain", action="store_true",
                          help="Desactiver l'analyse on-chain XRPL")
 
@@ -1744,14 +1758,31 @@ Exemples:
     api_secret = args.secret or os.environ.get("BINANCE_API_SECRET", "")
     MIN_MOVE_USD = args.min_move
 
-    # Mode turbo: scan agressif pour serveur puissant
+    # Mode turbo: scan rapide pour serveur puissant
     if args.turbo:
         args.loop = True
         args.loop_delay = max(args.loop_delay, 3) if args.loop_delay != 30 else 3
         args.timeframes = ['1m', '3m', '5m', '15m']
-        MIN_MOVE_USD = 0.02  # Accepter les micro-mouvements en test
+        MIN_MOVE_USD = 0.02
         if not args.realtime:
-            args.realtime = HAS_WEBSOCKET  # Auto-activer websocket si dispo
+            args.realtime = HAS_WEBSOCKET
+
+    # Mode agressif: force des trades meme en marche calme
+    if args.aggressive:
+        args.loop = True
+        if args.loop_delay == 30:
+            args.loop_delay = 5
+        MIN_MOVE_USD = 0.005  # Quasi zero - on accepte tout
+        RSI_OVERBOUGHT = 60   # RSI 60 au lieu de 70 = plus de signaux sell
+        RSI_OVERSOLD = 40     # RSI 40 au lieu de 30 = plus de signaux buy
+        VOL_SPIKE_MULT = 1.2  # Volume spike a 1.2x au lieu de 1.5x
+        BB_STD = 1.5          # Bollinger plus serrees = touches plus frequentes
+        if args.sell_threshold == 70:
+            args.sell_threshold = 35
+        if args.buy_threshold == 70:
+            args.buy_threshold = 35
+        if not args.realtime:
+            args.realtime = HAS_WEBSOCKET
 
     # Securite: loop-delay minimum 2s pour ne pas spam l'API
     args.loop_delay = max(2, args.loop_delay)
@@ -1784,11 +1815,18 @@ Exemples:
     mode_str = 'WEBSOCKET TEMPS REEL' if args.realtime else 'POLLING PARALLELE'
     if args.turbo:
         mode_str += ' [TURBO]'
+    if args.aggressive:
+        mode_str += ' [AGRESSIF]'
     print(f"  Mode            : {mode_str}")
     print(f"  Scan interval   : {args.loop_delay}s" if args.loop else "")
     print(f"  Mouvement min.  : {MIN_MOVE_USD} USD")
     onchain_str = 'DESACTIVE' if args.no_onchain else ('ACTIF' if HAS_REQUESTS else 'pip install requests')
     print(f"  On-chain XRPL   : {onchain_str}" + (f" ({ONCHAIN_WEIGHT*100:.0f}% du score)" if not args.no_onchain and HAS_REQUESTS else ""))
+    if args.aggressive:
+        print(f"  RSI overbought  : {RSI_OVERBOUGHT} (normal: 70)")
+        print(f"  RSI oversold    : {RSI_OVERSOLD} (normal: 30)")
+        print(f"  Bollinger STD   : {BB_STD} (normal: 2.0)")
+        print(f"  Vol spike mult  : {VOL_SPIKE_MULT}x (normal: 1.5x)")
     if args.trade:
         print(f"  Trading         : {'DRY-RUN' if args.dry_run else 'REEL'}")
         print(f"  Quantite/trade  : {args.quantity} XRP")
