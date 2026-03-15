@@ -1487,8 +1487,96 @@ def round_tick_size(price, tick_size):
         Decimal(str(tick_size)), rounding=ROUND_DOWN))
 
 
+# =============================================================================
+# POSITION TRACKER - Suivi des positions ouvertes pour TP/SL
+# =============================================================================
+
+class PositionTracker:
+    """Suit la position ouverte pour appliquer stop-loss et take-profit."""
+
+    def __init__(self):
+        self.in_position = False
+        self.entry_price = 0.0
+        self.entry_qty = 0.0
+        self.entry_side = ""  # "BUY" = on a achete, on attend de vendre
+        self.entry_time = None
+        self.trades_count = 0
+        self.total_pnl = 0.0  # P&L cumule en USDT
+
+    def open_position(self, side, price, qty):
+        self.in_position = True
+        self.entry_price = price
+        self.entry_qty = qty
+        self.entry_side = side
+        self.entry_time = datetime.now()
+        trade_logger.info(f"[POSITION] OPEN {side} {qty} XRP @ {price:.4f}")
+
+    def close_position(self, exit_price):
+        if not self.in_position:
+            return 0.0
+        if self.entry_side == "BUY":
+            pnl = (exit_price - self.entry_price) * self.entry_qty
+        else:
+            pnl = (self.entry_price - exit_price) * self.entry_qty
+        # Soustraire frais Binance (~0.1% par trade, 0.2% aller-retour)
+        fees = (self.entry_price * self.entry_qty * 0.001) + (exit_price * self.entry_qty * 0.001)
+        net_pnl = pnl - fees
+        self.total_pnl += net_pnl
+        self.trades_count += 1
+        duration = datetime.now() - self.entry_time if self.entry_time else None
+        dur_str = str(duration).split('.')[0] if duration else "?"
+        trade_logger.info(
+            f"[POSITION] CLOSE @ {exit_price:.4f} | "
+            f"PnL brut: {pnl:+.4f} USDT | Frais: -{fees:.4f} | "
+            f"Net: {net_pnl:+.4f} USDT | Duree: {dur_str}")
+        print(f"\n  {'='*50}")
+        print(f"  CLOTURE POSITION")
+        print(f"  Entree: {self.entry_price:.4f} -> Sortie: {exit_price:.4f}")
+        print(f"  PnL brut: {pnl:+.4f} USDT | Frais: -{fees:.4f}")
+        print(f"  >>> PnL NET: {net_pnl:+.4f} USDT <<<")
+        print(f"  Cumul: {self.total_pnl:+.4f} USDT ({self.trades_count} trades)")
+        print(f"  Duree: {dur_str}")
+        print(f"  {'='*50}")
+        self.in_position = False
+        self.entry_price = 0.0
+        self.entry_qty = 0.0
+        self.entry_side = ""
+        self.entry_time = None
+        return net_pnl
+
+    def check_tp_sl(self, current_price, take_profit_pct, stop_loss_pct):
+        """Verifie si TP ou SL est atteint. Retourne 'TP', 'SL', ou None."""
+        if not self.in_position or not self.entry_price:
+            return None
+        if self.entry_side == "BUY":
+            change_pct = ((current_price - self.entry_price) / self.entry_price) * 100
+        else:
+            change_pct = ((self.entry_price - current_price) / self.entry_price) * 100
+        if take_profit_pct > 0 and change_pct >= take_profit_pct:
+            return 'TP'
+        if stop_loss_pct > 0 and change_pct <= -stop_loss_pct:
+            return 'SL'
+        return None
+
+    def status_str(self, current_price):
+        if not self.in_position:
+            return "Pas de position"
+        if self.entry_side == "BUY":
+            change_pct = ((current_price - self.entry_price) / self.entry_price) * 100
+        else:
+            change_pct = ((self.entry_price - current_price) / self.entry_price) * 100
+        return (f"EN POSITION: {self.entry_side} {self.entry_qty} XRP @ {self.entry_price:.4f} | "
+                f"Actuel: {current_price:.4f} ({change_pct:+.3f}%)")
+
+
+# Instance globale
+position_tracker = PositionTracker()
+
+
 def execute_combined_trade(client, combined, trade_config):
-    """Execute un trade base sur le score multi-TF combine."""
+    """Execute un trade base sur le score multi-TF combine, avec TP/SL."""
+    global position_tracker
+
     sell_score = combined['combined_sell']
     buy_score = combined['combined_buy']
     move_ok = combined['move_ok']
@@ -1504,6 +1592,8 @@ def execute_combined_trade(client, combined, trade_config):
     order_type = trade_config['order_type']
     symbol_info = trade_config.get('symbol_info')
     record_mode = trade_config.get('record', True)
+    take_profit_pct = trade_config.get('take_profit', 0.0)
+    stop_loss_pct = trade_config.get('stop_loss', 0.0)
 
     # TF info pour l'historique
     tf_info = {tf: {'sell': d.get('sell_score', 0), 'buy': d.get('buy_score', 0)}
@@ -1521,6 +1611,54 @@ def execute_combined_trade(client, combined, trade_config):
     print(f"  Confirmations : SELL {combined['confirmations_sell']}/{combined['total_tf']} | "
           f"BUY {combined['confirmations_buy']}/{combined['total_tf']}")
 
+    # --- PRIORITE 1: Verifier TP/SL si on a une position ouverte ---
+    if position_tracker.in_position and (take_profit_pct > 0 or stop_loss_pct > 0):
+        tp_sl = position_tracker.check_tp_sl(price, take_profit_pct, stop_loss_pct)
+        print(f"  Position    : {position_tracker.status_str(price)}")
+        if take_profit_pct > 0:
+            tp_price = position_tracker.entry_price * (1 + take_profit_pct / 100)
+            print(f"  Take-Profit : {tp_price:.4f} (+{take_profit_pct}%)")
+        if stop_loss_pct > 0:
+            sl_price = position_tracker.entry_price * (1 - stop_loss_pct / 100)
+            print(f"  Stop-Loss   : {sl_price:.4f} (-{stop_loss_pct}%)")
+
+        if tp_sl == 'TP':
+            print(f"\n  >>> TAKE-PROFIT ATTEINT ! Fermeture position <<<")
+            close_side = 'SELL' if position_tracker.entry_side == 'BUY' else 'BUY'
+            close_price = price if order_type == "LIMIT" else None
+            result = _place_order(client, close_side, position_tracker.entry_qty,
+                                  close_price, dry_run, order_type, symbol_info)
+            if result:
+                position_tracker.close_position(price)
+            if record_mode:
+                record_signal(close_side, sell_score, price, rsi, trend,
+                              potential_move, tf_info, traded=result is not None,
+                              trade_result=f"TP {'DRY-RUN' if dry_run else 'EXECUTED'}")
+            return
+
+        elif tp_sl == 'SL':
+            print(f"\n  >>> STOP-LOSS ATTEINT ! Fermeture position <<<")
+            close_side = 'SELL' if position_tracker.entry_side == 'BUY' else 'BUY'
+            close_price = price if order_type == "LIMIT" else None
+            result = _place_order(client, close_side, position_tracker.entry_qty,
+                                  close_price, dry_run, order_type, symbol_info)
+            if result:
+                position_tracker.close_position(price)
+            if record_mode:
+                record_signal(close_side, sell_score, price, rsi, trend,
+                              potential_move, tf_info, traded=result is not None,
+                              trade_result=f"SL {'DRY-RUN' if dry_run else 'EXECUTED'}")
+            return
+
+    elif position_tracker.in_position:
+        print(f"  Position    : {position_tracker.status_str(price)}")
+
+    # --- PRIORITE 2: Si deja en position, pas de nouveau trade ---
+    if position_tracker.in_position:
+        print(f"  En attente TP/SL... (pas de nouveau trade)")
+        return
+
+    # --- PRIORITE 3: Ouvrir une nouvelle position sur signal ---
     if sell_score >= sell_threshold and move_ok:
         trade_qty = min(quantity, xrp_balance['free'])
         if trade_qty <= 0:
@@ -1533,6 +1671,9 @@ def execute_combined_trade(client, combined, trade_config):
 
         result = _place_order(client, 'SELL', trade_qty, sell_price,
                               dry_run, order_type, symbol_info)
+
+        if result and (take_profit_pct > 0 or stop_loss_pct > 0):
+            position_tracker.open_position('SELL', price, trade_qty)
 
         if record_mode:
             record_signal("SELL", sell_score, price, rsi, trend,
@@ -1558,6 +1699,9 @@ def execute_combined_trade(client, combined, trade_config):
 
         result = _place_order(client, 'BUY', trade_qty, buy_price,
                               dry_run, order_type, symbol_info)
+
+        if result and (take_profit_pct > 0 or stop_loss_pct > 0):
+            position_tracker.open_position('BUY', price, trade_qty)
 
         if record_mode:
             record_signal("BUY", buy_score, price, rsi, trend,
@@ -1701,6 +1845,13 @@ Exemples:
 
   # Turbo + agressif (combo ultime bare metal)
   python xrp_signal_pro.py --turbo --aggressive --trade --quantity 5 --key CLE --secret SECRET
+
+  # MODE SCALP: micro-profits automatiques avec TP/SL
+  python xrp_signal_pro.py --scalp --dry-run --key CLE --secret SECRET
+  python xrp_signal_pro.py --scalp --quantity 10 --key CLE --secret SECRET
+
+  # TP/SL personnalise
+  python xrp_signal_pro.py --aggressive --trade --take-profit 0.6 --stop-loss 0.3 --key CLE --secret SECRET
         """
     )
 
@@ -1743,6 +1894,12 @@ Exemples:
                            help="Score min pour acheter (defaut: 70)")
     grp_trade.add_argument("--order-type", default="LIMIT",
                            choices=["LIMIT", "MARKET"])
+    grp_trade.add_argument("--stop-loss", type=float, default=0.0,
+                           help="Stop-loss en %% (ex: 0.3 = ferme si perte de 0.3%%)")
+    grp_trade.add_argument("--take-profit", type=float, default=0.0,
+                           help="Take-profit en %% (ex: 0.5 = ferme si gain de 0.5%%)")
+    grp_trade.add_argument("--scalp", action="store_true",
+                           help="Mode scalp: micro-profits pour couvrir frais + petit gain")
 
     # Historique
     grp_hist = parser.add_argument_group("Historique")
@@ -1784,6 +1941,36 @@ Exemples:
         if not args.realtime:
             args.realtime = HAS_WEBSOCKET
 
+    # Mode scalp: optimise pour micro-profits couvrant les frais Binance
+    # Frais Binance: 0.1% maker x2 = 0.2% aller-retour (0.15% avec BNB)
+    # TP 0.45% - frais 0.2% = 0.25% net par trade gagnant
+    # SL 0.25% + frais 0.2% = 0.45% perte par trade perdant
+    # Il faut un winrate > 64% pour etre rentable
+    if args.scalp:
+        args.trade = True
+        args.loop = True
+        args.aggressive = True  # Active le mode agressif aussi
+        if args.loop_delay == 30:
+            args.loop_delay = 5
+        MIN_MOVE_USD = 0.003
+        RSI_OVERBOUGHT = 62
+        RSI_OVERSOLD = 38
+        VOL_SPIKE_MULT = 1.2
+        BB_STD = 1.5
+        if args.sell_threshold == 70:
+            args.sell_threshold = 40
+        if args.buy_threshold == 70:
+            args.buy_threshold = 40
+        if args.stop_loss == 0.0:
+            args.stop_loss = 0.25   # SL: -0.25% pour limiter les pertes
+        if args.take_profit == 0.0:
+            args.take_profit = 0.45  # TP: +0.45% net ~0.25% apres frais
+        if args.order_type == "LIMIT":
+            args.order_type = "LIMIT"  # Maker fee = moins cher
+        args.timeframes = ['1m', '3m', '5m', '15m']
+        if not args.realtime:
+            args.realtime = HAS_WEBSOCKET
+
     # Securite: loop-delay minimum 2s pour ne pas spam l'API
     args.loop_delay = max(2, args.loop_delay)
 
@@ -1817,16 +2004,24 @@ Exemples:
         mode_str += ' [TURBO]'
     if args.aggressive:
         mode_str += ' [AGRESSIF]'
+    if args.scalp:
+        mode_str += ' [SCALP]'
     print(f"  Mode            : {mode_str}")
     print(f"  Scan interval   : {args.loop_delay}s" if args.loop else "")
     print(f"  Mouvement min.  : {MIN_MOVE_USD} USD")
     onchain_str = 'DESACTIVE' if args.no_onchain else ('ACTIF' if HAS_REQUESTS else 'pip install requests')
     print(f"  On-chain XRPL   : {onchain_str}" + (f" ({ONCHAIN_WEIGHT*100:.0f}% du score)" if not args.no_onchain and HAS_REQUESTS else ""))
-    if args.aggressive:
+    if args.scalp:
+        print(f"  ** MODE SCALP ** : TP +{args.take_profit}% / SL -{args.stop_loss}%")
+        print(f"  Profit net/trade: ~{args.take_profit - 0.2:+.2f}% (apres frais 0.2%)")
+    if args.aggressive or args.scalp:
         print(f"  RSI overbought  : {RSI_OVERBOUGHT} (normal: 70)")
         print(f"  RSI oversold    : {RSI_OVERSOLD} (normal: 30)")
         print(f"  Bollinger STD   : {BB_STD} (normal: 2.0)")
         print(f"  Vol spike mult  : {VOL_SPIKE_MULT}x (normal: 1.5x)")
+    if args.take_profit > 0 or args.stop_loss > 0:
+        print(f"  Take-Profit     : +{args.take_profit}%" if args.take_profit > 0 else "")
+        print(f"  Stop-Loss       : -{args.stop_loss}%" if args.stop_loss > 0 else "")
     if args.trade:
         print(f"  Trading         : {'DRY-RUN' if args.dry_run else 'REEL'}")
         print(f"  Quantite/trade  : {args.quantity} XRP")
@@ -1853,6 +2048,8 @@ Exemples:
             'order_type': args.order_type,
             'symbol_info': get_symbol_info(client) if args.trade else None,
             'record': True,
+            'take_profit': args.take_profit,
+            'stop_loss': args.stop_loss,
         }
 
     # === MODE WEBSOCKET TEMPS REEL ===
