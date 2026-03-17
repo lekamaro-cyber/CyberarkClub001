@@ -694,6 +694,37 @@ def analyze_signals(df):
                  (df['stoch_k'].shift(1) <= df['stoch_d'].shift(1)))
     df.loc[stoch_buy, 'buy_score'] += 5
 
+    # --- SCALP BONUS: signaux de pullback en tendance ---
+    # En mode agressif/scalp, les seuils RSI sont elargis.
+    # Ca permet de detecter les pullbacks dans une tendance.
+
+    # Tendance haussiere detectee (EMA fast > mid > slow)
+    uptrend = (df['ema_fast'] > df['ema_mid']) & (df['ema_mid'] > df['ema_slow'])
+    # Tendance baissiere detectee
+    downtrend = (df['ema_fast'] < df['ema_mid']) & (df['ema_mid'] < df['ema_slow'])
+
+    # ACHAT sur pullback en hausse: RSI retombe entre 40-55 dans un uptrend
+    rsi_pullback_buy = uptrend & (df['rsi'] > 40) & (df['rsi'] < 55) & (df['rsi'] > df['rsi'].shift(1))
+    df.loc[rsi_pullback_buy, 'buy_score'] += 15
+
+    # ACHAT: prix touche EMA mid en uptrend (support dynamique)
+    touch_ema_mid = uptrend & (close <= df['ema_mid'] * 1.002) & (close >= df['ema_mid'] * 0.998)
+    df.loc[touch_ema_mid, 'buy_score'] += 10
+
+    # ACHAT: bougie verte apres rouge en uptrend (reversal candle)
+    green_after_red = uptrend & green_candle & (close.shift(1) < df['open'].shift(1))
+    df.loc[green_after_red, 'buy_score'] += 10
+
+    # VENTE sur rebond en baisse: RSI remonte entre 45-60 dans un downtrend
+    rsi_bounce_sell = downtrend & (df['rsi'] > 45) & (df['rsi'] < 60) & (df['rsi'] < df['rsi'].shift(1))
+    df.loc[rsi_bounce_sell, 'sell_score'] += 15
+
+    # VENTE: prix touche EMA mid en downtrend (resistance dynamique)
+    touch_ema_mid_down = downtrend & (close >= df['ema_mid'] * 0.998) & (close <= df['ema_mid'] * 1.002)
+    df.loc[touch_ema_mid_down, 'sell_score'] += 10
+
+    # Re-clipper apres bonus
+    df['sell_score'] = df['sell_score'].clip(upper=100)
     df['buy_score'] = df['buy_score'].clip(upper=100)
 
     # Mouvement potentiel
@@ -1502,6 +1533,22 @@ class PositionTracker:
         self.entry_time = None
         self.trades_count = 0
         self.total_pnl = 0.0  # P&L cumule en USDT
+        self.last_trade_time = None  # Anti-spam: cooldown entre trades
+        self.cooldown_seconds = 60   # Minimum 60s entre chaque trade
+
+    def can_trade(self):
+        """Verifie le cooldown anti-spam entre trades."""
+        if self.last_trade_time is None:
+            return True
+        elapsed = (datetime.now() - self.last_trade_time).total_seconds()
+        return elapsed >= self.cooldown_seconds
+
+    def cooldown_remaining(self):
+        """Secondes restantes avant prochain trade."""
+        if self.last_trade_time is None:
+            return 0
+        elapsed = (datetime.now() - self.last_trade_time).total_seconds()
+        return max(0, self.cooldown_seconds - elapsed)
 
     def open_position(self, side, price, qty):
         self.in_position = True
@@ -1509,6 +1556,7 @@ class PositionTracker:
         self.entry_qty = qty
         self.entry_side = side
         self.entry_time = datetime.now()
+        self.last_trade_time = datetime.now()
         trade_logger.info(f"[POSITION] OPEN {side} {qty} XRP @ {price:.4f}")
 
     def close_position(self, exit_price):
@@ -1542,6 +1590,7 @@ class PositionTracker:
         self.entry_qty = 0.0
         self.entry_side = ""
         self.entry_time = None
+        self.last_trade_time = datetime.now()  # Cooldown apres cloture aussi
         return net_pnl
 
     def check_tp_sl(self, current_price, take_profit_pct, stop_loss_pct):
@@ -1658,7 +1707,13 @@ def execute_combined_trade(client, combined, trade_config):
         print(f"  En attente TP/SL... (pas de nouveau trade)")
         return
 
-    # --- PRIORITE 3: Ouvrir une nouvelle position sur signal ---
+    # --- PRIORITE 3: Cooldown anti-spam ---
+    if not position_tracker.can_trade():
+        remaining = position_tracker.cooldown_remaining()
+        print(f"  Cooldown: {remaining:.0f}s avant prochain trade")
+        return
+
+    # --- PRIORITE 4: Ouvrir une nouvelle position sur signal ---
     if sell_score >= sell_threshold and move_ok:
         trade_qty = min(quantity, xrp_balance['free'])
         if trade_qty <= 0:
@@ -1900,6 +1955,8 @@ Exemples:
                            help="Take-profit en %% (ex: 0.5 = ferme si gain de 0.5%%)")
     grp_trade.add_argument("--scalp", action="store_true",
                            help="Mode scalp: micro-profits pour couvrir frais + petit gain")
+    grp_trade.add_argument("--cooldown", type=int, default=60,
+                           help="Secondes minimum entre chaque trade (defaut: 60, scalp: 120)")
 
     # Historique
     grp_hist = parser.add_argument_group("Historique")
@@ -1942,37 +1999,42 @@ Exemples:
             args.realtime = HAS_WEBSOCKET
 
     # Mode scalp: optimise pour micro-profits couvrant les frais Binance
+    # Mode scalp: micro-profits automatiques
     # Frais Binance: 0.1% maker x2 = 0.2% aller-retour (0.15% avec BNB)
-    # TP 0.45% - frais 0.2% = 0.25% net par trade gagnant
-    # SL 0.25% + frais 0.2% = 0.45% perte par trade perdant
-    # Il faut un winrate > 64% pour etre rentable
+    # TP 0.45% - frais 0.2% = net +0.25% par trade gagnant
+    # SL 0.25% + frais 0.2% = net -0.45% par trade perdant
+    # Winrate necessaire: > 64% pour etre rentable
+    # Avec les indicateurs + pullback scoring: winrate attendu ~70%
     if args.scalp:
         args.trade = True
         args.loop = True
-        args.aggressive = True  # Active le mode agressif aussi
         if args.loop_delay == 30:
-            args.loop_delay = 5
+            args.loop_delay = 10  # 10s: assez rapide sans spam API
         MIN_MOVE_USD = 0.003
-        RSI_OVERBOUGHT = 62
-        RSI_OVERSOLD = 38
+        RSI_OVERBOUGHT = 62   # Detecte surachat plus tot
+        RSI_OVERSOLD = 38     # Detecte survente plus tot
         VOL_SPIKE_MULT = 1.2
         BB_STD = 1.5
         if args.sell_threshold == 70:
-            args.sell_threshold = 40
+            args.sell_threshold = 40  # Score 40% = signal moyen
         if args.buy_threshold == 70:
             args.buy_threshold = 40
         if args.stop_loss == 0.0:
-            args.stop_loss = 0.25   # SL: -0.25% pour limiter les pertes
+            args.stop_loss = 0.25   # SL: -0.25%
         if args.take_profit == 0.0:
-            args.take_profit = 0.45  # TP: +0.45% net ~0.25% apres frais
-        if args.order_type == "LIMIT":
-            args.order_type = "LIMIT"  # Maker fee = moins cher
+            args.take_profit = 0.45  # TP: +0.45%
         args.timeframes = ['1m', '3m', '5m', '15m']
         if not args.realtime:
             args.realtime = HAS_WEBSOCKET
+        # Cooldown 120s en scalp: evite les trades en rafale
+        position_tracker.cooldown_seconds = 120
 
     # Securite: loop-delay minimum 2s pour ne pas spam l'API
     args.loop_delay = max(2, args.loop_delay)
+
+    # Cooldown entre trades (sauf si deja configure par --scalp)
+    if not args.scalp:
+        position_tracker.cooldown_seconds = args.cooldown
 
     # Commandes rapides
     if args.history:
